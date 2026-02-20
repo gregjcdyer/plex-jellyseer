@@ -1,84 +1,83 @@
 import os
 import requests
+from urllib.parse import quote
 from plexapi.myplex import MyPlexAccount
-from plexapi.server import PlexServer
 
-PLEX_URL        = os.getenv("PLEX_URL")
-PLEX_TOKEN      = os.getenv("PLEX_TOKEN")
+
 PLEX_USERNAME   = os.getenv("PLEX_USERNAME")
 PLEX_PASSWORD   = os.getenv("PLEX_PASSWORD")
-JELLYSEERR_URL  = os.getenv("JELLYSEERR_URL")
+JELLYSEERR_URL  = os.getenv("JELLYSEERR_URL", "").rstrip("/")
 JELLYSEERR_API  = os.getenv("JELLYSEERR_API")
 
 
 def get_plex_watchlist():
-    plex = PlexServer(PLEX_URL, PLEX_TOKEN)
+    print("Logging into Plex account...")
     account = MyPlexAccount(PLEX_USERNAME, PLEX_PASSWORD)
+    print(f"Logged into Plex account: {account.username}")
     return account.watchlist()
 
 
 def jellyseerr_search(query):
-    url = f"{JELLYSEERR_URL}/api/v1/search"
+    url = f"{JELLYSEERR_URL}/api/v1/search?query={quote(query)}&language=en&page=1"
     headers = {"X-Api-Key": JELLYSEERR_API}
-    params = {"query": query}
-    r = requests.get(url, headers=headers, params=params)
+    r = requests.get(url, headers=headers)
+    if not r.ok:
+        print(f"Search failed {r.status_code}: {r.text}")
     r.raise_for_status()
     return r.json()
 
 
-def jellyseerr_media_status(tmdb_id, media_type):
-    """Check if media is already requested/available in Jellyseerr"""
-    url = f"{JELLYSEERR_URL}/api/v1/media/{tmdb_id}"
-    headers = {"X-Api-Key": JELLYSEERR_API}
-    r = requests.get(url, headers=headers)
-    if r.status_code == 404:
-        return None  # Not in Jellyseerr yet
-    r.raise_for_status()
-    data = r.json()
-    return data.get("status")
-
-
-def jellyseerr_request(media_type, tmdb_id):
+def jellyseerr_request(media_type, tmdb_id, seasons=None):
     url = f"{JELLYSEERR_URL}/api/v1/request"
     headers = {"X-Api-Key": JELLYSEERR_API, "Content-Type": "application/json"}
-    payload = {"mediaType": media_type, "mediaId": tmdb_id}
+    payload = {"mediaType": media_type, "mediaId": int(tmdb_id)}
+    if media_type == "tv":
+        payload["seasons"] = seasons or "all"
     r = requests.post(url, headers=headers, json=payload)
+    if not r.ok:
+        print(f"Request failed {r.status_code}: {r.text}")
     r.raise_for_status()
     return r.json()
 
 
 def sync_watchlist_to_jellyseerr():
     watchlist = get_plex_watchlist()
+    print(f"Found {len(watchlist)} items in Plex watchlist")
 
     for item in watchlist:
         title = item.title
         year = getattr(item, "year", None)
-        print(f"🔎 Searching for: {title} ({year})")
+        print(f"Searching for: {title} ({year})")
 
         results = jellyseerr_search(title)
 
         if not results.get("results"):
-            print(f"❌ No match found in Jellyseerr for {title}")
+            print(f"No match found in Jellyseerr for {title}")
             continue
 
         match = results["results"][0]
         tmdb_id = match.get("id")
         media_type = match.get("mediaType")
 
-        print(f"✅ Found match: {match.get('title')} ({media_type}, TMDB {tmdb_id})")
+        print(f"Found match: {match.get('title')} ({media_type}, TMDB {tmdb_id})")
 
-        # Check if already requested/available
-        status = jellyseerr_media_status(tmdb_id, media_type)
-        if status and status not in ("UNKNOWN", "UNKNOWN_ERROR"):
-            print(f"⏩ Skipping {title} — already {status}")
+        # mediaInfo is included in search results — status 5=AVAILABLE, 4=PARTIALLY_AVAILABLE, 3=PROCESSING, 2=PENDING
+        media_info = match.get("mediaInfo") or {}
+        status = media_info.get("status", 1)  # 1 = UNKNOWN (not yet in Jellyseerr)
+        if status and status > 1:
+            print(f"Skipping {title} — already has status {status}")
             continue
 
         # Otherwise, request it
         try:
-            res = jellyseerr_request(media_type, tmdb_id)
-            print(f"📩 Requested: {res}")
+            seasons = None
+            if media_type == "tv":
+                num_seasons = match.get("numberOfSeasons") or 1
+                seasons = list(range(1, num_seasons + 1))
+            res = jellyseerr_request(media_type, tmdb_id, seasons)
+            print(f"Requested: {match.get('title')} ({media_type})")
         except requests.exceptions.RequestException as e:
-            print(f"⚠️ Failed to request {title}: {e}")
+            print(f"Failed to request {title}: {e}")
 
 
 if __name__ == "__main__":
